@@ -265,6 +265,11 @@ class Dia2:
             )
         )
 
+        # crop_start_frame mirrors generate()'s crop logic: skip aligned frames before
+        # the first generated word. start_step is the last prefix frame index, so
+        # aligned frames < start_step are prefix audio that should be trimmed.
+        crop_start_frame = 0 if include_prefix_audio else start_step
+
         chunks: list[torch.Tensor] = []
         for chunk in stream_generation_loop(
             runtime,
@@ -275,6 +280,7 @@ class Dia2:
             logger=logger,
             chunk_frames=chunk_frames,
             include_prefix_audio=include_prefix_audio,
+            crop_start_frame=crop_start_frame,
         ):
             chunks.append(chunk)
             yield chunk

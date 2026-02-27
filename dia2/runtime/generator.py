@@ -374,6 +374,7 @@ def stream_generation_loop(
     logger: RuntimeLogger | None = None,
     chunk_frames: int = 1,
     include_prefix_audio: bool = False,
+    crop_start_frame: int = 0,
 ) -> Generator[torch.Tensor, None, None]:
     """Generator that yields decoded PCM chunks (shape [N_samples]) as audio tokens are produced.
 
@@ -422,6 +423,11 @@ def stream_generation_loop(
     OVERLAP_FRAMES = 8
     context_tokens: Optional[torch.Tensor] = None  # [1, depth_q, <=OVERLAP_FRAMES]
     samples_per_frame = runtime.mimi.samples_per_frame
+    # crop_start_frame: aligned frame index before which output is suppressed (prefix trimming).
+    # Frames before this index are kept in last_frames to seed overlap context when output starts.
+    crop_frame: int = crop_start_frame
+    last_frames: list[torch.Tensor] = []  # pre-crop frames kept as overlap context seed
+    context_seeded: bool = crop_frame == 0  # no seeding needed if no crop
 
     for offset in range(max_context):
         # Yield OUTSIDE inference_mode — decode happened in the previous iteration
@@ -540,20 +546,33 @@ def stream_generation_loop(
             if aligned_idx >= 0:
                 src_indices = aligned_idx + delay_tensor
                 frame = audio_buf[0, frame_indices, src_indices]
-                pending.append(frame.unsqueeze(0).unsqueeze(-1))
-                if len(pending) >= chunk_frames:
-                    new_tokens = torch.cat(pending, dim=-1)  # [1, depth_q, chunk_frames]
-                    if context_tokens is not None:
-                        full_tokens = torch.cat([context_tokens, new_tokens], dim=-1)
-                        full_audio = decode_audio(runtime, full_tokens)
-                        n_ctx_samples = context_tokens.shape[-1] * samples_per_frame
-                        to_yield = full_audio[n_ctx_samples:]
-                    else:
-                        to_yield = decode_audio(runtime, new_tokens)
-                    # Slide context window forward
-                    all_so_far = new_tokens if context_tokens is None else torch.cat([context_tokens, new_tokens], dim=-1)
-                    context_tokens = all_so_far[:, :, -OVERLAP_FRAMES:]
-                    pending.clear()
+                frame_tokens = frame.unsqueeze(0).unsqueeze(-1)
+
+                if aligned_idx < crop_frame:
+                    # Pre-crop: accumulate in rolling buffer to seed overlap context later
+                    last_frames.append(frame_tokens)
+                    if len(last_frames) > OVERLAP_FRAMES:
+                        last_frames.pop(0)
+                else:
+                    # Post-crop: seed context_tokens once from the pre-crop rolling buffer
+                    if not context_seeded:
+                        if last_frames:
+                            context_tokens = torch.cat(last_frames, dim=-1)
+                        context_seeded = True
+                        last_frames.clear()
+                    pending.append(frame_tokens)
+                    if len(pending) >= chunk_frames:
+                        new_tokens = torch.cat(pending, dim=-1)  # [1, depth_q, chunk_frames]
+                        if context_tokens is not None:
+                            full_tokens = torch.cat([context_tokens, new_tokens], dim=-1)
+                            full_audio = decode_audio(runtime, full_tokens)
+                            n_ctx_samples = context_tokens.shape[-1] * samples_per_frame
+                            to_yield = full_audio[n_ctx_samples:]
+                        else:
+                            to_yield = decode_audio(runtime, new_tokens)
+                        all_so_far = new_tokens if context_tokens is None else torch.cat([context_tokens, new_tokens], dim=-1)
+                        context_tokens = all_so_far[:, :, -OVERLAP_FRAMES:]
+                        pending.clear()
 
             if eos_cutoff is None and state.end_step is not None:
                 eos_cutoff = state.end_step + flush_tail
@@ -573,7 +592,7 @@ def stream_generation_loop(
     # frame at (last_step + 1 - max_delay) is now complete but was never added inside the loop.
     if last_step >= start_step:
         post_idx = last_step + 1 - max_delay
-        if post_idx >= 0:
+        if post_idx >= 0 and post_idx >= crop_frame:
             with torch.inference_mode():
                 src_indices = post_idx + delay_tensor
                 if delay_tensor.numel() == 0 or int(src_indices.max().item()) < audio_buf.shape[-1]:
@@ -582,6 +601,8 @@ def stream_generation_loop(
 
     # Flush remaining frames with overlap context
     if pending:
+        if not context_seeded and last_frames:
+            context_tokens = torch.cat(last_frames, dim=-1)
         new_tokens = torch.cat(pending, dim=-1)
         if context_tokens is not None:
             full_tokens = torch.cat([context_tokens, new_tokens], dim=-1)
