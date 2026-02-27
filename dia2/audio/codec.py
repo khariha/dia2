@@ -52,6 +52,26 @@ class MimiCodec(nn.Module):
             audio, _ = self.model.decode(codes, return_dict=False)
             return torch.clamp(audio, -1.0, 1.0)
 
+    def decode_stateful(self, codes: torch.Tensor, past_key_values=None):
+        """Stateful decode for streaming — carries decoder KV cache between calls.
+
+        Each call processes `codes` incrementally using context from previous calls,
+        eliminating the boundary discontinuities that cause clicking when decoding
+        frame-by-frame without state.
+
+        Returns:
+            waveform: torch.Tensor, shape [batch, 1, N_samples], float32 in [-1, 1]
+            new_past_key_values: pass into the next call to maintain continuity
+        """
+        codes = codes.to(self.device)
+        with torch.inference_mode():
+            audio, new_pkv = self.model.decode(
+                codes,
+                decoder_past_key_values=past_key_values,
+                return_dict=False,
+            )
+            return torch.clamp(audio, -1.0, 1.0), new_pkv
+
     def encode(self, audio: torch.Tensor, *, return_dict: bool = False):
         audio = audio.to(self.device)
         with torch.inference_mode():

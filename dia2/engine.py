@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Generator, Optional, Sequence
 
 from .assets import resolve_assets
 from .runtime.context import RuntimeContext, build_runtime
@@ -9,6 +9,7 @@ from .runtime.generator import (
     build_initial_state,
     decode_audio,
     run_generation_loop,
+    stream_generation_loop,
     warmup_with_prefix,
 )
 from .runtime.script_parser import parse_script
@@ -98,6 +99,67 @@ class Dia2:
             self._runtime = self._build_runtime()
         return self._runtime
 
+    def _prepare_generation(
+        self,
+        script: str | Sequence[str],
+        *,
+        config: Optional[GenerationConfig] = None,
+        prefix_speaker_1: Optional[str] = None,
+        prefix_speaker_2: Optional[str] = None,
+        include_prefix: Optional[bool] = None,
+        verbose: bool = False,
+        overrides: Optional[dict] = None,
+    ):
+        """Shared setup for generate() and generate_stream(): parse script, build prefix plan,
+        warm up KV cache, and return everything needed to run the generation loop."""
+        runtime = self._ensure_runtime()
+        logger = RuntimeLogger(verbose)
+        merged_overrides = dict(overrides or {})
+
+        if prefix_speaker_1 is not None:
+            merged_overrides["prefix_speaker_1"] = prefix_speaker_1
+        if prefix_speaker_2 is not None:
+            merged_overrides["prefix_speaker_2"] = prefix_speaker_2
+        if include_prefix is not None:
+            merged_overrides["include_prefix"] = include_prefix
+
+        merged = merge_generation_config(base=config or self.default_config, overrides=merged_overrides)
+
+        max_context = runtime.config.runtime.max_context_steps
+        text = normalize_script(script)
+
+        prefix_plan = build_prefix_plan(runtime, merged.prefix)
+
+        entries = []
+        if prefix_plan is not None:
+            entries.extend(prefix_plan.entries)
+        entries.extend(parse_script([text], runtime.tokenizer, runtime.constants, runtime.frame_rate))
+        runtime.machine.initial_padding = merged.initial_padding
+        logger.event(
+            f"starting generation: max_context={max_context} cfg_scale={merged.cfg_scale:.2f} "
+            f"device={self.device} dtype={self._dtype_pref}"
+        )
+
+        state = runtime.machine.new_state(entries)
+        cfg_active = merged.cfg_scale != 1.0
+        if cfg_active:
+            logger.event(f"classifier-free guidance enabled (scale={merged.cfg_scale:.2f})")
+        else:
+            logger.event("classifier-free guidance disabled (scale=1.0)")
+        gen_state = build_initial_state(runtime, prefix=prefix_plan)
+        include_prefix_audio = bool(prefix_plan and merged.prefix and merged.prefix.include_audio)
+        start_step = 0
+
+        if prefix_plan is not None:
+            logger.event(f"warming up with prefix ({prefix_plan.aligned_frames} frames)")
+            start_step = warmup_with_prefix(runtime, prefix_plan, state, gen_state)
+            if include_prefix_audio:
+                logger.event("prefix audio will be kept in output")
+            else:
+                logger.event("prefix audio trimmed from output")
+
+        return runtime, merged, state, gen_state, start_step, include_prefix_audio, prefix_plan, logger
+
     def generate(
         self,
         script: str | Sequence[str],
@@ -110,47 +172,18 @@ class Dia2:
         verbose: bool = False,
         **overrides,
     ):
-        runtime = self._ensure_runtime()
-        logger = RuntimeLogger(verbose)
-        merged_overrides = dict(overrides)
-        if prefix_speaker_1 is not None:
-            merged_overrides["prefix_speaker_1"] = prefix_speaker_1
-        if prefix_speaker_2 is not None:
-            merged_overrides["prefix_speaker_2"] = prefix_speaker_2
-        if include_prefix is not None:
-            merged_overrides["include_prefix"] = include_prefix
-        merged = merge_generation_config(base=config or self.default_config, overrides=merged_overrides)
-        max_context = runtime.config.runtime.max_context_steps
-        text = normalize_script(script)
-        prefix_plan = build_prefix_plan(runtime, merged.prefix)
-        entries = []
-        if prefix_plan is not None:
-            entries.extend(prefix_plan.entries)
-        entries.extend(parse_script([text], runtime.tokenizer, runtime.constants, runtime.frame_rate))
-        runtime.machine.initial_padding = merged.initial_padding
-        logger.event(
-            f"starting generation: max_context={max_context} cfg_scale={merged.cfg_scale:.2f} "
-            f"device={self.device} dtype={self._dtype_pref}"
+        runtime, merged, state, gen_state, start_step, include_prefix_audio, prefix_plan, logger = (
+            self._prepare_generation(
+                script,
+                config=config,
+                prefix_speaker_1=prefix_speaker_1,
+                prefix_speaker_2=prefix_speaker_2,
+                include_prefix=include_prefix,
+                verbose=verbose,
+                overrides=overrides,
+            )
         )
-        state = runtime.machine.new_state(entries)
-        cfg_active = merged.cfg_scale != 1.0
-        if cfg_active:
-            logger.event(f"classifier-free guidance enabled (scale={merged.cfg_scale:.2f})")
-        else:
-            logger.event("classifier-free guidance disabled (scale=1.0)")
-        gen_state = build_initial_state(
-            runtime,
-            prefix=prefix_plan,
-        )
-        include_prefix_audio = bool(prefix_plan and merged.prefix and merged.prefix.include_audio)
-        start_step = 0
-        if prefix_plan is not None:
-            logger.event(f"warming up with prefix ({prefix_plan.aligned_frames} frames)")
-            start_step = warmup_with_prefix(runtime, prefix_plan, state, gen_state)
-            if include_prefix_audio:
-                logger.event("prefix audio will be kept in output")
-            else:
-                logger.event("prefix audio trimmed from output")
+
         first_word_frame, audio_buf = run_generation_loop(
             runtime,
             state=state,
@@ -159,6 +192,7 @@ class Dia2:
             start_step=start_step,
             logger=logger,
         )
+
         aligned = undelay_frames(audio_buf[0], runtime.audio_delays, runtime.constants.audio_pad).unsqueeze(0)
         crop = 0 if include_prefix_audio else max(first_word_frame, 0)
         if crop > 0 and crop < aligned.shape[-1]:
@@ -166,6 +200,7 @@ class Dia2:
         elif crop >= aligned.shape[-1]:
             crop = 0
         logger.event(f"decoding {aligned.shape[-1]} Mimi frames")
+
         waveform = decode_audio(runtime, aligned)
         if output_wav is not None:
             write_wav(str(output_wav), waveform.detach().cpu().numpy(), runtime.mimi.sample_rate)
@@ -187,6 +222,69 @@ class Dia2:
             timestamps.append((word, adj / frame_rate))
         logger.event(f"generation finished in {logger.elapsed():.2f}s")
         return GenerationResult(aligned, waveform, runtime.mimi.sample_rate, timestamps)
+
+    def generate_stream(
+        self,
+        script: str | Sequence[str],
+        *,
+        config: Optional[GenerationConfig] = None,
+        output_wav: Optional[str | Path] = None,
+        prefix_speaker_1: Optional[str] = None,
+        prefix_speaker_2: Optional[str] = None,
+        include_prefix: Optional[bool] = None,
+        verbose: bool = False,
+        chunk_frames: int = 1,
+        **overrides,
+    ) -> Generator["torch.Tensor", None, None]:
+        """Stream audio as a generator, yielding torch.Tensor PCM chunks as they are produced.
+
+        Each yielded chunk has shape [N_samples] (float32, range [-1, 1]) at sample_rate Hz.
+        chunk_frames controls how many Mimi frames (~80 ms each at 12.5 fps) are decoded per
+        yield — larger values reduce call overhead at the cost of higher initial latency.
+
+        Applies the same initial crop as generate() (prefix audio is trimmed when
+        include_prefix is False). If output_wav is provided, the full waveform is written
+        to disk after streaming completes.
+
+        Example::
+
+            for chunk in dia.generate_stream("[S1] Hello Dia2!"):
+                play(chunk.detach().cpu().numpy())  # float32 in [-1, 1]
+        """
+        import torch
+
+        runtime, merged, state, gen_state, start_step, include_prefix_audio, prefix_plan, logger = (
+            self._prepare_generation(
+                script,
+                config=config,
+                prefix_speaker_1=prefix_speaker_1,
+                prefix_speaker_2=prefix_speaker_2,
+                include_prefix=include_prefix,
+                verbose=verbose,
+                overrides=overrides,
+            )
+        )
+
+        chunks: list[torch.Tensor] = []
+        for chunk in stream_generation_loop(
+            runtime,
+            state=state,
+            generation=gen_state,
+            config=merged,
+            start_step=start_step,
+            logger=logger,
+            chunk_frames=chunk_frames,
+            include_prefix_audio=include_prefix_audio,
+        ):
+            chunks.append(chunk)
+            yield chunk
+
+        if output_wav is not None and chunks:
+            waveform = torch.cat(chunks)
+            write_wav(str(output_wav), waveform.detach().cpu().numpy(), runtime.mimi.sample_rate)
+            duration = waveform.shape[-1] / max(runtime.mimi.sample_rate, 1)
+            logger.event(f"saved {output_wav} ({duration:.2f}s)")
+        logger.event(f"generation finished in {logger.elapsed():.2f}s")
 
     def save_wav(self, script: str | Sequence[str], path: str | Path, **kwargs):
         return self.generate(script, output_wav=path, **kwargs)

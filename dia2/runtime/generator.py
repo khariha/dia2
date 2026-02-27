@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Generator, Optional, Tuple
 
 import torch
 
@@ -364,6 +364,234 @@ def run_generation_loop(
     return first_word_frame, trimmed
 
 
+def stream_generation_loop(
+    runtime: RuntimeContext,
+    *,
+    state: State,
+    generation: GenerationState,
+    config: GenerationConfig,
+    start_step: int = 0,
+    logger: RuntimeLogger | None = None,
+    chunk_frames: int = 1,
+    include_prefix_audio: bool = False,
+) -> Generator[torch.Tensor, None, None]:
+    """Generator that yields decoded PCM chunks (shape [N_samples]) as audio tokens are produced.
+
+    Each Mimi frame (~80 ms at 24 kHz) becomes available after its audio_delays warmup period.
+    chunk_frames controls how many aligned frames are batched before each Mimi decode + yield.
+
+    Yields are always issued OUTSIDE torch.inference_mode() to avoid context-manager suspension
+    issues. The decoded chunk is computed inside inference_mode and staged in `to_yield`, then
+    yielded at the top of the next iteration.
+    """
+    step_tokens = generation.step_tokens
+    audio_buf = generation.audio_buf
+    branches = step_tokens.shape[0]
+    max_context = runtime.config.runtime.max_context_steps
+    if max_context <= 0:
+        raise ValueError("Runtime configuration must specify a positive max_context_steps")
+    positions = torch.empty(1, 1, dtype=torch.long, device=runtime.device)
+    main_tokens = torch.empty(branches, dtype=torch.long, device=runtime.device)
+    aux_tokens = torch.empty(branches, dtype=torch.long, device=runtime.device)
+    cfg_active = config.cfg_scale != 1.0
+    token_ids = runtime.constants
+    delay_tensor = runtime.audio_delay_tensor
+    max_delay = int(delay_tensor.max().item()) if delay_tensor.numel() else 0
+    depth_q = audio_buf.shape[1]
+    flush_tail = max_delay + getattr(runtime.machine, "max_padding", 0)
+    first_word_frame: Optional[int] = None
+    eos_cutoff: Optional[int] = None
+    last_step = start_step - 1
+    use_graph = bool(config.use_cuda_graph and runtime.device.type == "cuda")
+    transformer_step = runtime.transformer_step
+    depformer_step = runtime.depformer_step
+    buffers = _allocate_network_buffers(runtime, branches)
+    positions_view = positions.expand(branches, -1)
+    transformer_capture = None
+    dep_captures: list[dict] | None = None
+    if use_graph:
+        _ensure_graph_cublas_ready(runtime.device)
+    processed_steps = 0
+    report_interval = 12
+
+    pending: list[torch.Tensor] = []
+    frame_indices = torch.arange(depth_q, device=runtime.device)
+    to_yield: Optional[torch.Tensor] = None  # staged chunk to emit at start of next iteration
+    # Overlap-decode: prepend the last OVERLAP_FRAMES token frames to each chunk decode so the
+    # causal conv layers (kernel=7 at the token level) have proper past context at every boundary.
+    OVERLAP_FRAMES = 8
+    context_tokens: Optional[torch.Tensor] = None  # [1, depth_q, <=OVERLAP_FRAMES]
+    samples_per_frame = runtime.mimi.samples_per_frame
+
+    for offset in range(max_context):
+        # Yield OUTSIDE inference_mode — decode happened in the previous iteration
+        if to_yield is not None:
+            yield to_yield
+            to_yield = None
+
+        with torch.inference_mode():
+            t = start_step + offset
+            if eos_cutoff is not None and t >= eos_cutoff:
+                break
+            if t + 1 >= audio_buf.shape[-1]:
+                break
+            generation.reset_dep_cache()
+            positions.fill_(t)
+            _fill_audio_channels(step_tokens, audio_buf, delay_tensor, t, token_ids.audio_bos)
+            if branches > 1:
+                step_tokens[1:, 0, 0] = token_ids.zero
+                step_tokens[1:, 1, 0] = token_ids.pad
+            if use_graph:
+                if transformer_capture is None:
+                    torch.cuda.synchronize()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        hidden_ref = _execute_transformer_step(
+                            step_tokens, positions_view, generation, transformer_step, buffers,
+                        )
+                    transformer_capture = (graph, hidden_ref)
+                    if runtime.model.depformer.num_depth > 0:
+                        dep_captures = []
+                        for idx in range(runtime.model.depformer.num_depth):
+                            capture = {
+                                "graph": torch.cuda.CUDAGraph(),
+                                "captured": False,
+                                "prev_audio": torch.empty((branches,), dtype=torch.long, device=runtime.device),
+                                "main_tokens": torch.empty((branches,), dtype=torch.long, device=runtime.device) if idx == 0 else None,
+                                "second_tokens": torch.empty((branches,), dtype=torch.long, device=runtime.device) if idx == 0 else None,
+                            }
+                            dep_captures.append(capture)
+                else:
+                    transformer_capture[0].replay()
+                hidden_t = transformer_capture[1]
+            else:
+                hidden_t = _execute_transformer_step(
+                    step_tokens, positions_view, generation, transformer_step, buffers,
+                )
+
+            guided_text = apply_classifier_guidance(buffers.text, cfg_active, config.cfg_scale, config.cfg_filter_k)
+            if guided_text.shape[0] > 1:
+                guided_text = guided_text[:1]
+            text_token = sample_token(
+                guided_text, temp=config.text.temperature, top_k=config.text.top_k,
+            ).item()
+
+            main_token, aux_token, _ = runtime.machine.process(t, state, text_token)
+            second_token = aux_token if aux_token != -1 else token_ids.pad
+            if first_word_frame is None and main_token == token_ids.new_word:
+                first_word_frame = t - config.initial_padding
+            step_tokens[:, 0, 0] = main_token
+            step_tokens[:, 1, 0] = second_token
+
+            guided_cb0 = apply_classifier_guidance(buffers.cb0, cfg_active, config.cfg_scale, config.cfg_filter_k)
+            if guided_cb0.shape[0] > 1:
+                guided_cb0 = guided_cb0[:1]
+            masked_cb0 = mask_audio_logits(guided_cb0, token_ids.audio_pad, token_ids.audio_bos)
+            codebook_token = sample_audio_logits(masked_cb0, config.audio.temperature, config.audio.top_k)
+            audio_buf[:, 0, t + 1] = codebook_token
+
+            prev_audio = codebook_token.expand(branches)
+            main_tokens.fill_(main_token)
+            aux_tokens.fill_(second_token)
+            for stage in range(runtime.model.depformer.num_depth):
+                if use_graph and dep_captures is not None:
+                    capture = dep_captures[stage]
+                    capture["prev_audio"].copy_(prev_audio)
+                    if capture["main_tokens"] is not None and stage == 0:
+                        capture["main_tokens"].copy_(main_tokens)
+                        capture["second_tokens"].copy_(aux_tokens)
+                    if not capture["captured"]:
+                        torch.cuda.synchronize()
+                        with torch.cuda.graph(capture["graph"]):
+                            _execute_depformer_stage(
+                                stage_index=stage,
+                                prev_audio=capture["prev_audio"],
+                                hidden_t=hidden_t,
+                                generation=generation,
+                                depformer_step=depformer_step,
+                                main_tokens=capture["main_tokens"],
+                                second_tokens=capture["second_tokens"],
+                                buffers=buffers,
+                            )
+                        capture["captured"] = True
+                    else:
+                        capture["graph"].replay()
+                else:
+                    _execute_depformer_stage(
+                        stage_index=stage,
+                        prev_audio=prev_audio,
+                        hidden_t=hidden_t,
+                        generation=generation,
+                        depformer_step=depformer_step,
+                        main_tokens=main_tokens,
+                        second_tokens=aux_tokens,
+                        buffers=buffers,
+                    )
+                dep_logits = apply_classifier_guidance(buffers.dep[stage], cfg_active, config.cfg_scale, config.cfg_filter_k)
+                if dep_logits.shape[0] > 1:
+                    dep_logits = dep_logits[:1]
+                stage_token = sample_audio_logits(dep_logits, config.audio.temperature, config.audio.top_k)
+                audio_buf[:, stage + 1, t + 1] = stage_token
+                prev_audio = stage_token.expand(branches)
+            last_step = t
+
+            # After step t, aligned frame (t - max_delay) is newly complete
+            aligned_idx = t - max_delay
+            if aligned_idx >= 0:
+                src_indices = aligned_idx + delay_tensor
+                frame = audio_buf[0, frame_indices, src_indices]
+                pending.append(frame.unsqueeze(0).unsqueeze(-1))
+                if len(pending) >= chunk_frames:
+                    new_tokens = torch.cat(pending, dim=-1)  # [1, depth_q, chunk_frames]
+                    if context_tokens is not None:
+                        full_tokens = torch.cat([context_tokens, new_tokens], dim=-1)
+                        full_audio = decode_audio(runtime, full_tokens)
+                        n_ctx_samples = context_tokens.shape[-1] * samples_per_frame
+                        to_yield = full_audio[n_ctx_samples:]
+                    else:
+                        to_yield = decode_audio(runtime, new_tokens)
+                    # Slide context window forward
+                    all_so_far = new_tokens if context_tokens is None else torch.cat([context_tokens, new_tokens], dim=-1)
+                    context_tokens = all_so_far[:, :, -OVERLAP_FRAMES:]
+                    pending.clear()
+
+            if eos_cutoff is None and state.end_step is not None:
+                eos_cutoff = state.end_step + flush_tail
+            processed_steps = offset + 1
+            if logger and processed_steps % report_interval == 0:
+                logger.progress(processed_steps, max_context)
+
+    # Yield any staged chunk from the final loop iteration
+    if to_yield is not None:
+        yield to_yield
+        to_yield = None
+
+    if logger and processed_steps and processed_steps % report_interval != 0:
+        logger.progress(processed_steps, max_context)
+
+    # Post-loop: audio_buf[:, :, last_step+1] was filled in the last step, so the aligned
+    # frame at (last_step + 1 - max_delay) is now complete but was never added inside the loop.
+    if last_step >= start_step:
+        post_idx = last_step + 1 - max_delay
+        if post_idx >= 0:
+            with torch.inference_mode():
+                src_indices = post_idx + delay_tensor
+                if delay_tensor.numel() == 0 or int(src_indices.max().item()) < audio_buf.shape[-1]:
+                    frame = audio_buf[0, frame_indices, src_indices]
+                    pending.append(frame.unsqueeze(0).unsqueeze(-1))
+
+    # Flush remaining frames with overlap context
+    if pending:
+        new_tokens = torch.cat(pending, dim=-1)
+        if context_tokens is not None:
+            full_tokens = torch.cat([context_tokens, new_tokens], dim=-1)
+            full_audio = decode_audio(runtime, full_tokens)
+            n_ctx_samples = context_tokens.shape[-1] * samples_per_frame
+            yield full_audio[n_ctx_samples:]
+        else:
+            yield decode_audio(runtime, new_tokens)
+
+
 def decode_audio(runtime: RuntimeContext, tokens: torch.Tensor) -> torch.Tensor:
     if tokens.shape[-1] == 0:
         return torch.zeros(0, device=runtime.device)
@@ -414,6 +642,7 @@ def warmup_with_prefix(
 __all__ = [
     "build_initial_state",
     "run_generation_loop",
+    "stream_generation_loop",
     "decode_audio",
     "warmup_with_prefix",
     "GenerationState",
