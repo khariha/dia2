@@ -48,6 +48,14 @@ def main() -> None:
     parser.add_argument("--prefix-speaker-1", help="Prefix audio file for speaker 1")
     parser.add_argument("--prefix-speaker-2", help="Prefix audio file for speaker 2")
     parser.add_argument(
+        "--transcript-speaker-1",
+        help="JSON file with pre-computed transcript for speaker 1 prefix (skips Whisper)",
+    )
+    parser.add_argument(
+        "--transcript-speaker-2",
+        help="JSON file with pre-computed transcript for speaker 2 prefix (skips Whisper)",
+    )
+    parser.add_argument(
         "--include-prefix",
         action="store_true",
         help="Keep prefix audio in the final waveform (default: trimmed)",
@@ -106,6 +114,10 @@ def main() -> None:
         overrides["prefix_speaker_1"] = args.prefix_speaker_1
     if args.prefix_speaker_2:
         overrides["prefix_speaker_2"] = args.prefix_speaker_2
+    if args.transcript_speaker_1:
+        overrides["prefix_speaker_1_transcript"] = args.transcript_speaker_1
+    if args.transcript_speaker_2:
+        overrides["prefix_speaker_2_transcript"] = args.transcript_speaker_2
     if args.include_prefix:
         overrides["include_prefix"] = True
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Mapping, Optional, Sequence, Tuple
+from typing import Any, List, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -27,6 +27,19 @@ class PrefixConfig:
     speaker_1: Optional[str] = None
     speaker_2: Optional[str] = None
     include_audio: bool = False
+    # Pre-computed transcripts for prefix audio. When provided, Whisper
+    # transcription is skipped entirely.  Accepts a path to a JSON file or
+    # a list of dicts, each with "text", "start", and "end" keys:
+    #
+    #   [
+    #     {"text": "Hello", "start": 0.0, "end": 0.35},
+    #     {"text": "world", "start": 0.4, "end": 0.72}
+    #   ]
+    #
+    # "start" and "end" are in seconds and correspond to word-level
+    # timestamps (the same format Whisper produces).
+    transcript_speaker_1: Optional[Union[str, List[Any]]] = None
+    transcript_speaker_2: Optional[Union[str, List[Any]]] = None
 
 
 @dataclass(frozen=True)
@@ -46,6 +59,32 @@ class GenerationResult:
     waveform: torch.Tensor
     sample_rate: int
     timestamps: List[Tuple[str, float]]
+    prefix_transcripts: Optional[dict] = None
+
+
+class AudioStream:
+    """Wrapper around a streaming audio generator that also exposes prefix transcripts.
+
+    Iterating over an ``AudioStream`` yields ``torch.Tensor`` PCM chunks
+    (shape ``[N_samples]``, float32 in ``[-1, 1]``), identical to
+    iterating over a bare generator.
+
+    ``prefix_transcripts`` is available immediately (before iteration
+    begins) and contains the Whisper transcript + audio hash for each
+    prefix speaker, in a format that can be passed back via
+    ``prefix_speaker_1_transcript`` / ``prefix_speaker_2_transcript``
+    to skip Whisper on subsequent calls.
+    """
+
+    def __init__(self, generator, prefix_transcripts: Optional[dict] = None) -> None:
+        self._generator = generator
+        self.prefix_transcripts = prefix_transcripts
+
+    def __iter__(self):
+        return self._generator
+
+    def __next__(self):
+        return next(self._generator)
 
 
 def normalize_script(script: str | Sequence[str]) -> str:
@@ -105,6 +144,8 @@ def merge_generation_config(
     prefix_speaker_1 = clean_overrides.pop("prefix_speaker_1", None)
     prefix_speaker_2 = clean_overrides.pop("prefix_speaker_2", None)
     include_prefix = clean_overrides.pop("include_prefix", None)
+    transcript_speaker_1 = clean_overrides.pop("prefix_speaker_1_transcript", None)
+    transcript_speaker_2 = clean_overrides.pop("prefix_speaker_2_transcript", None)
 
     text_sampling = base.text
     if text_temp is not None or text_topk is not None:
@@ -125,6 +166,8 @@ def merge_generation_config(
         prefix_speaker_1 is not None
         or prefix_speaker_2 is not None
         or include_prefix is not None
+        or transcript_speaker_1 is not None
+        or transcript_speaker_2 is not None
         or prefix_cfg is not None
     ):
         prefix_cfg = prefix_cfg or PrefixConfig()
@@ -132,6 +175,8 @@ def merge_generation_config(
             speaker_1=prefix_speaker_1 if prefix_speaker_1 is not None else prefix_cfg.speaker_1,
             speaker_2=prefix_speaker_2 if prefix_speaker_2 is not None else prefix_cfg.speaker_2,
             include_audio=include_prefix if include_prefix is not None else prefix_cfg.include_audio,
+            transcript_speaker_1=transcript_speaker_1 if transcript_speaker_1 is not None else prefix_cfg.transcript_speaker_1,
+            transcript_speaker_2=transcript_speaker_2 if transcript_speaker_2 is not None else prefix_cfg.transcript_speaker_2,
         )
 
     return GenerationConfig(
@@ -146,6 +191,7 @@ def merge_generation_config(
 
 
 __all__ = [
+    "AudioStream",
     "SamplingConfig",
     "GenerationConfig",
     "GenerationResult",

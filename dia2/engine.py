@@ -16,6 +16,7 @@ from .runtime.script_parser import parse_script
 from .audio.grid import undelay_frames, write_wav
 from .runtime.voice_clone import build_prefix_plan
 from .generation import (
+    AudioStream,
     GenerationConfig,
     GenerationResult,
     merge_generation_config,
@@ -106,6 +107,8 @@ class Dia2:
         config: Optional[GenerationConfig] = None,
         prefix_speaker_1: Optional[str] = None,
         prefix_speaker_2: Optional[str] = None,
+        prefix_speaker_1_transcript=None,
+        prefix_speaker_2_transcript=None,
         include_prefix: Optional[bool] = None,
         verbose: bool = False,
         overrides: Optional[dict] = None,
@@ -120,6 +123,10 @@ class Dia2:
             merged_overrides["prefix_speaker_1"] = prefix_speaker_1
         if prefix_speaker_2 is not None:
             merged_overrides["prefix_speaker_2"] = prefix_speaker_2
+        if prefix_speaker_1_transcript is not None:
+            merged_overrides["prefix_speaker_1_transcript"] = prefix_speaker_1_transcript
+        if prefix_speaker_2_transcript is not None:
+            merged_overrides["prefix_speaker_2_transcript"] = prefix_speaker_2_transcript
         if include_prefix is not None:
             merged_overrides["include_prefix"] = include_prefix
 
@@ -168,6 +175,8 @@ class Dia2:
         output_wav: Optional[str | Path] = None,
         prefix_speaker_1: Optional[str] = None,
         prefix_speaker_2: Optional[str] = None,
+        prefix_speaker_1_transcript=None,
+        prefix_speaker_2_transcript=None,
         include_prefix: Optional[bool] = None,
         verbose: bool = False,
         **overrides,
@@ -178,6 +187,8 @@ class Dia2:
                 config=config,
                 prefix_speaker_1=prefix_speaker_1,
                 prefix_speaker_2=prefix_speaker_2,
+                prefix_speaker_1_transcript=prefix_speaker_1_transcript,
+                prefix_speaker_2_transcript=prefix_speaker_2_transcript,
                 include_prefix=include_prefix,
                 verbose=verbose,
                 overrides=overrides,
@@ -220,8 +231,10 @@ class Dia2:
             if adj < 0:
                 continue
             timestamps.append((word, adj / frame_rate))
+
+        prefix_transcripts = prefix_plan.transcripts if prefix_plan is not None else None
         logger.event(f"generation finished in {logger.elapsed():.2f}s")
-        return GenerationResult(aligned, waveform, runtime.mimi.sample_rate, timestamps)
+        return GenerationResult(aligned, waveform, runtime.mimi.sample_rate, timestamps, prefix_transcripts)
 
     def generate_stream(
         self,
@@ -231,25 +244,34 @@ class Dia2:
         output_wav: Optional[str | Path] = None,
         prefix_speaker_1: Optional[str] = None,
         prefix_speaker_2: Optional[str] = None,
+        prefix_speaker_1_transcript=None,
+        prefix_speaker_2_transcript=None,
         include_prefix: Optional[bool] = None,
         verbose: bool = False,
         chunk_frames: int = 1,
         **overrides,
-    ) -> Generator["torch.Tensor", None, None]:
-        """Stream audio as a generator, yielding torch.Tensor PCM chunks as they are produced.
+    ) -> AudioStream:
+        """Stream audio, returning an AudioStream that yields torch.Tensor PCM chunks.
 
         Each yielded chunk has shape [N_samples] (float32, range [-1, 1]) at sample_rate Hz.
         chunk_frames controls how many Mimi frames (~80 ms each at 12.5 fps) are decoded per
         yield — larger values reduce call overhead at the cost of higher initial latency.
 
-        Applies the same initial crop as generate() (prefix audio is trimmed when
-        include_prefix is False). If output_wav is provided, the full waveform is written
-        to disk after streaming completes.
+        The returned AudioStream has a ``prefix_transcripts`` attribute containing
+        the Whisper transcript and audio hash for each prefix speaker. This can be
+        passed back via ``prefix_speaker_1_transcript`` / ``prefix_speaker_2_transcript``
+        on subsequent calls to skip Whisper transcription::
 
-        Example::
+            stream = dia.generate_stream(script, prefix_speaker_1="speaker.wav")
+            for chunk in stream:
+                play(chunk.cpu().numpy())
+            # Save for next call:
+            transcript = stream.prefix_transcripts["speaker_1"]
 
-            for chunk in dia.generate_stream("[S1] Hello Dia2!"):
-                play(chunk.detach().cpu().numpy())  # float32 in [-1, 1]
+            # Next call — Whisper skipped:
+            stream = dia.generate_stream(script,
+                prefix_speaker_1="speaker.wav",
+                prefix_speaker_1_transcript=transcript)
         """
         import torch
 
@@ -259,38 +281,41 @@ class Dia2:
                 config=config,
                 prefix_speaker_1=prefix_speaker_1,
                 prefix_speaker_2=prefix_speaker_2,
+                prefix_speaker_1_transcript=prefix_speaker_1_transcript,
+                prefix_speaker_2_transcript=prefix_speaker_2_transcript,
                 include_prefix=include_prefix,
                 verbose=verbose,
                 overrides=overrides,
             )
         )
 
-        # crop_start_frame mirrors generate()'s crop logic: skip aligned frames before
-        # the first generated word. start_step is the last prefix frame index, so
-        # aligned frames < start_step are prefix audio that should be trimmed.
         crop_start_frame = 0 if include_prefix_audio else start_step
+        prefix_transcripts = prefix_plan.transcripts if prefix_plan is not None else None
 
-        chunks: list[torch.Tensor] = []
-        for chunk in stream_generation_loop(
-            runtime,
-            state=state,
-            generation=gen_state,
-            config=merged,
-            start_step=start_step,
-            logger=logger,
-            chunk_frames=chunk_frames,
-            include_prefix_audio=include_prefix_audio,
-            crop_start_frame=crop_start_frame,
-        ):
-            chunks.append(chunk)
-            yield chunk
+        def _generate() -> Generator[torch.Tensor, None, None]:
+            chunks: list[torch.Tensor] = []
+            for chunk in stream_generation_loop(
+                runtime,
+                state=state,
+                generation=gen_state,
+                config=merged,
+                start_step=start_step,
+                logger=logger,
+                chunk_frames=chunk_frames,
+                include_prefix_audio=include_prefix_audio,
+                crop_start_frame=crop_start_frame,
+            ):
+                chunks.append(chunk)
+                yield chunk
 
-        if output_wav is not None and chunks:
-            waveform = torch.cat(chunks)
-            write_wav(str(output_wav), waveform.detach().cpu().numpy(), runtime.mimi.sample_rate)
-            duration = waveform.shape[-1] / max(runtime.mimi.sample_rate, 1)
-            logger.event(f"saved {output_wav} ({duration:.2f}s)")
-        logger.event(f"generation finished in {logger.elapsed():.2f}s")
+            if output_wav is not None and chunks:
+                waveform = torch.cat(chunks)
+                write_wav(str(output_wav), waveform.detach().cpu().numpy(), runtime.mimi.sample_rate)
+                duration = waveform.shape[-1] / max(runtime.mimi.sample_rate, 1)
+                logger.event(f"saved {output_wav} ({duration:.2f}s)")
+            logger.event(f"generation finished in {logger.elapsed():.2f}s")
+
+        return AudioStream(_generate(), prefix_transcripts)
 
     def save_wav(self, script: str | Sequence[str], path: str | Path, **kwargs):
         return self.generate(script, output_wav=path, **kwargs)

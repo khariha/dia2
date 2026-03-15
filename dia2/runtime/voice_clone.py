@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Sequence, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Sequence, TYPE_CHECKING, Union
 
 import numpy as np
 import torch
@@ -27,6 +29,71 @@ class PrefixPlan:
     new_word_steps: List[int]
     aligned_tokens: torch.Tensor
     aligned_frames: int
+    transcripts: Dict[str, Any]
+
+
+def parse_transcript(
+    transcript: Union[str, List[Any], Dict[str, Any]],
+) -> List[WhisperWord]:
+    """Parse a user-provided transcript into a list of :class:`WhisperWord`.
+
+    *transcript* may be either:
+
+    * A ``str`` path to a JSON file, or
+    * A ``list`` of dicts already loaded in memory, or
+    * A ``dict`` with an ``"audio_hash"`` and ``"words"`` key (as returned by
+      a previous generation call).
+
+    Each word entry must have ``"text"``, ``"start"`` (seconds), and ``"end"``
+    (seconds) keys.
+    """
+    if isinstance(transcript, str):
+        with open(transcript, "r") as f:
+            data = json.load(f)
+    else:
+        data = transcript
+
+    # Accept the dict format returned by generate()/generate_stream()
+    if isinstance(data, dict):
+        data = data.get("words", [])
+
+    if not isinstance(data, list):
+        raise ValueError("Transcript must be a JSON array of word objects")
+
+    words: List[WhisperWord] = []
+    for entry in data:
+        text = str(entry.get("text", "")).strip()
+        if not text:
+            continue
+        words.append(
+            WhisperWord(
+                text=text,
+                start=float(entry["start"]),
+                end=float(entry["end"]),
+            )
+        )
+    return words
+
+
+def _hash_audio_file(audio_path: str) -> str:
+    """Compute a SHA-256 hash of an audio file's contents."""
+    h = hashlib.sha256()
+    with open(audio_path, "rb") as f:
+        for block in iter(lambda: f.read(65536), b""):
+            h.update(block)
+    return f"sha256:{h.hexdigest()}"
+
+
+def _build_transcript_dict(
+    audio_path: str, words: List[WhisperWord]
+) -> Dict[str, Any]:
+    """Build a transcript dict with audio hash and word list."""
+    return {
+        "audio_hash": _hash_audio_file(audio_path),
+        "words": [
+            {"text": w.text, "start": w.start, "end": w.end} for w in words
+        ],
+    }
 
 
 def build_prefix_plan(
@@ -44,15 +111,26 @@ def build_prefix_plan(
             raise ValueError("speaker_2 requires speaker_1 to be provided")
         return None
 
-    transcribe = transcribe_fn or (lambda path, device: transcribe_words(path, device))
+    default_transcribe = transcribe_fn or (lambda path, device: transcribe_words(path, device))
     load_audio = load_audio_fn or (lambda path, sr: load_mono_audio(path, sr))
     encode_audio = encode_fn or (lambda audio: encode_audio_tokens(runtime.mimi, audio))
 
-    entries1, steps1, tokens1 = _process_prefix_audio(
+    # If a pre-computed transcript is provided for a speaker, build a
+    # transcribe function that returns the parsed words directly —
+    # skipping the Whisper model entirely.
+    if prefix.transcript_speaker_1 is not None:
+        spk1_words = parse_transcript(prefix.transcript_speaker_1)
+
+        def transcribe_spk1(_p: str, _d: torch.device) -> List[WhisperWord]:
+            return spk1_words
+    else:
+        transcribe_spk1 = default_transcribe
+
+    entries1, steps1, tokens1, words1 = _process_prefix_audio(
         runtime=runtime,
         audio_path=prefix.speaker_1,
         speaker_token=runtime.constants.spk1,
-        transcribe=transcribe,
+        transcribe=transcribe_spk1,
         load_audio=load_audio,
         encode_audio=encode_audio,
     )
@@ -61,12 +139,24 @@ def build_prefix_plan(
     new_word_steps = [step + offset for step in steps1]
     audio_tokens = tokens1.to(runtime.device)
 
+    transcripts: Dict[str, Any] = {
+        "speaker_1": _build_transcript_dict(prefix.speaker_1, words1),
+    }
+
     if prefix.speaker_2:
-        entries2, steps2, tokens2 = _process_prefix_audio(
+        if prefix.transcript_speaker_2 is not None:
+            spk2_words = parse_transcript(prefix.transcript_speaker_2)
+
+            def transcribe_spk2(_p: str, _d: torch.device) -> List[WhisperWord]:
+                return spk2_words
+        else:
+            transcribe_spk2 = default_transcribe
+
+        entries2, steps2, tokens2, words2 = _process_prefix_audio(
             runtime=runtime,
             audio_path=prefix.speaker_2,
             speaker_token=runtime.constants.spk2,
-            transcribe=transcribe,
+            transcribe=transcribe_spk2,
             load_audio=load_audio,
             encode_audio=encode_audio,
         )
@@ -74,12 +164,14 @@ def build_prefix_plan(
         new_word_steps.extend(step + spk1_frames for step in steps2)
         entries.extend(entries2)
         audio_tokens = torch.cat([audio_tokens, tokens2.to(runtime.device)], dim=1)
+        transcripts["speaker_2"] = _build_transcript_dict(prefix.speaker_2, words2)
 
     return PrefixPlan(
         entries=entries,
         new_word_steps=new_word_steps,
         aligned_tokens=audio_tokens,
         aligned_frames=audio_tokens.shape[-1],
+        transcripts=transcripts,
     )
 
 
@@ -91,7 +183,7 @@ def _process_prefix_audio(
     transcribe: Callable[[str, torch.device], List[WhisperWord]],
     load_audio: Callable[[str, int], np.ndarray],
     encode_audio: Callable[[np.ndarray], torch.Tensor],
-) -> tuple[List[Entry], List[int], torch.Tensor]:
+) -> tuple[List[Entry], List[int], torch.Tensor, List[WhisperWord]]:
     words = transcribe(audio_path, runtime.device)
     entries, steps = words_to_entries(
         words=words,
@@ -101,7 +193,7 @@ def _process_prefix_audio(
     )
     audio = load_audio(audio_path, runtime.mimi.sample_rate)
     tokens = encode_audio(audio)
-    return entries, steps, tokens
+    return entries, steps, tokens, words
 
 
 def transcribe_words(
@@ -185,6 +277,7 @@ __all__ = [
     "PrefixPlan",
     "WhisperWord",
     "build_prefix_plan",
+    "parse_transcript",
     "transcribe_words",
     "words_to_entries",
 ]
