@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 from torch import nn
@@ -19,12 +20,17 @@ class DecodeState:
 
 
 class Dia2Model(nn.Module):
-    def __init__(self, config: DiaConfig, precision: Precision):
+    def __init__(
+        self,
+        config: DiaConfig,
+        precision: Precision,
+        device: Optional[torch.device] = None,
+    ):
         super().__init__()
         self.config = config
         self.precision = precision
-        self.transformer = TransformerDecoder(config, precision)
-        self.depformer = Depformer(config, precision)
+        self.transformer = TransformerDecoder(config, precision, device)
+        self.depformer = Depformer(config, precision, device)
         self._cast_norms_to_compute()
 
     def init_state(self, batch_size: int, device: torch.device, max_steps: int) -> DecodeState:

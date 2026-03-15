@@ -6,7 +6,7 @@ from typing import Optional
 import warnings
 
 import torch
-from safetensors.torch import load_file
+from safetensors import safe_open
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from ..config import DiaConfig, load_config
@@ -14,6 +14,39 @@ from ..core.model import Dia2Model
 from ..core.precision import Precision, resolve_precision
 from ..audio import MimiCodec, DEFAULT_MIMI_MODEL_ID
 from .state_machine import StateMachine, TokenIds
+
+
+def load_file_into_model(
+    model: torch.nn.Module,
+    filename: str,
+    device: str = "cpu",
+) -> None:
+    """
+    Lazily loads a safetensors file sequentially into a model, avoiding holding
+    the entire state dict in memory at once.
+
+    Reduces peak memory compared to loading the full state dict and then calling
+    `model.load_state_dict()`.
+
+    Args:
+        model (`nn.Module`):
+            The model to load weights into
+        filename (`str`):
+            The name of the file which contains the tensors
+        device (`str`, *optional*, defaults to `cpu`):
+            The device where the tensors need to be located after load.
+
+    Example:
+    ```python
+    model = MyModel()
+    load_file_into_model(model, "./my_folder/bert.safetensors", device="cuda")
+    ```
+    """
+    state_dict = model.state_dict() # This is a shallow copy.
+    with safe_open(filename, framework="pt", device=device) as f:
+        for key in f.keys():
+            if key in state_dict:
+                state_dict[key].copy_(f.get_tensor(key))
 
 
 @dataclass
@@ -69,10 +102,8 @@ def build_runtime(
             torch.backends.cudnn.allow_tf32 = True
     precision = resolve_precision(dtype_pref, device_obj)
     config = load_config(config_path)
-    model = Dia2Model(config, precision)
-    state = load_file(str(weights_path))
-    model.load_state_dict(state)
-    model = model.to(device_obj)
+    model = Dia2Model(config, precision, device=device_obj)
+    load_file_into_model(model, str(weights_path), device=device)
 
     tokenizer_ref = tokenizer_id or config.assets.tokenizer or repo_id
     if tokenizer_ref is None:

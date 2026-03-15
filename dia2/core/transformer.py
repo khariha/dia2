@@ -1,16 +1,14 @@
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Tuple, Optional
 
 import torch
 from torch import nn
-import torch.nn.functional as F
 
 from ..config import DiaConfig
 from .cache import KVCache
 from .precision import Precision
 from .layers import (
-    AttentionShape,
     MultiStreamEmbedding,
     Mlp,
     Attention,
@@ -20,7 +18,12 @@ from .layers import (
 class TransformerDecoder(nn.Module):
     """Inference-time port of dia_v2.model.Transformer."""
 
-    def __init__(self, config: DiaConfig, precision: Precision):
+    def __init__(
+        self,
+        config: DiaConfig,
+        precision: Precision,
+        device: Optional[torch.device] = None,
+    ):
         super().__init__()
         self.config = config
         self.precision = precision
@@ -32,6 +35,7 @@ class TransformerDecoder(nn.Module):
                 nn.Embedding(
                     data_cfg.audio_vocab_size,
                     dec_cfg.n_embd,
+                    device=device,
                 )
                 for _ in range(max(0, data_cfg.channels - 2))
             ]
@@ -42,12 +46,13 @@ class TransformerDecoder(nn.Module):
             pad_id=data_cfg.text_pad_token_id,
             output_dtype=self.precision.compute,
             low_rank_dim=dec_cfg.low_rank_dim,
+            device=device,
         )
-        self.layers = nn.ModuleList([DecoderLayer(config, precision) for _ in range(dec_cfg.n_layer)])
-        self.norm = nn.RMSNorm(dec_cfg.n_embd, eps=config.model.normalization_layer_epsilon, dtype=torch.float32)
+        self.layers = nn.ModuleList([DecoderLayer(config, precision, device=device) for _ in range(dec_cfg.n_layer)])
+        self.norm = nn.RMSNorm(dec_cfg.n_embd, eps=config.model.normalization_layer_epsilon, dtype=torch.float32, device=device)
 
-        self.action_head = nn.Linear(dec_cfg.n_embd, data_cfg.action_vocab_size, bias=False)
-        self.cb0_head = nn.Linear(dec_cfg.n_embd, data_cfg.audio_vocab_size, bias=False)
+        self.action_head = nn.Linear(dec_cfg.n_embd, data_cfg.action_vocab_size, bias=False, device=device)
+        self.cb0_head = nn.Linear(dec_cfg.n_embd, data_cfg.audio_vocab_size, bias=False, device=device)
 
     def init_cache(self, batch_size: int, device: torch.device, max_steps: int) -> KVCache:
         heads = self.layers[0].attn.num_kv_heads
@@ -110,18 +115,24 @@ class TransformerDecoder(nn.Module):
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, config: DiaConfig, precision: Precision):
+    def __init__(
+        self,
+        config: DiaConfig,
+        precision: Precision,
+        device: Optional[torch.device] = None,
+    ):
         super().__init__()
         dec = config.model.decoder
         eps = config.model.normalization_layer_epsilon
-        self.pre_norm = nn.RMSNorm(dec.n_embd, eps=eps, dtype=torch.float32)
-        self.attn = Attention(config, dec.n_embd, precision.compute)
-        self.post_norm = nn.RMSNorm(dec.n_embd, eps=eps, dtype=torch.float32)
+        self.pre_norm = nn.RMSNorm(dec.n_embd, eps=eps, dtype=torch.float32, device=device)
+        self.attn = Attention(config, dec.n_embd, precision.compute, device=device)
+        self.post_norm = nn.RMSNorm(dec.n_embd, eps=eps, dtype=torch.float32, device=device)
         self.mlp = Mlp(
             dec.n_embd,
             dec.n_hidden,
             precision.compute,
             tuple(config.model.linear.mlp_activations),
+            device=device,
         )
 
     def decode_step(

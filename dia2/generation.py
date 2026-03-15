@@ -51,7 +51,7 @@ class GenerationConfig:
     initial_padding: int = 2
     prefix: Optional["PrefixConfig"] = None
     use_cuda_graph: bool = False
-
+    use_torch_compile: bool = False
 
 @dataclass(frozen=True)
 class GenerationResult:
@@ -187,6 +187,7 @@ def merge_generation_config(
         initial_padding=clean_overrides.pop("initial_padding", base.initial_padding),
         prefix=prefix_cfg,
         use_cuda_graph=clean_overrides.pop("use_cuda_graph", base.use_cuda_graph),
+        use_torch_compile=clean_overrides.pop("use_torch_compile", base.use_torch_compile),
     )
 
 
