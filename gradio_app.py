@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 import gradio as gr
+import numpy as np
 import torch
 
 from dia2 import Dia2, GenerationConfig, SamplingConfig
@@ -99,6 +100,24 @@ def _prepare_prefix(file_path: str | None) -> str | None:
     return str(path)
 
 
+def _numpy_to_mp3(audio: np.ndarray, sample_rate: int) -> bytes:
+    """Convert float32 numpy audio to MP3 bytes for Gradio streaming."""
+    import struct
+    import wave
+    audio_int16 = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(audio_int16.tobytes())
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Batch generation (original)
+# ---------------------------------------------------------------------------
+
 def generate_audio(
     turn_count: int,
     *inputs,
@@ -146,22 +165,116 @@ def generate_audio(
     return (sample_rate, waveform), table, log_text or "Generation finished."
 
 
+# ---------------------------------------------------------------------------
+# Streaming generation
+# ---------------------------------------------------------------------------
+
+def generate_audio_stream(
+    turn_count: int,
+    *inputs,
+):
+    turn_values = list(inputs[:MAX_TURNS])
+    voice_s1 = inputs[MAX_TURNS]
+    voice_s2 = inputs[MAX_TURNS + 1]
+    cfg_scale = float(inputs[MAX_TURNS + 2])
+    text_temperature = float(inputs[MAX_TURNS + 3])
+    audio_temperature = float(inputs[MAX_TURNS + 4])
+    text_top_k = int(inputs[MAX_TURNS + 5])
+    audio_top_k = int(inputs[MAX_TURNS + 6])
+    include_prefix = bool(inputs[MAX_TURNS + 7])
+    chunk_frames = int(inputs[MAX_TURNS + 8])
+
+    script = _concat_script(turn_count, turn_values)
+    if not script.strip():
+        raise gr.Error("Please enter at least one non-empty speaker turn.")
+
+    dia = _get_dia()
+    sample_rate = dia.sample_rate
+    config = GenerationConfig(
+        cfg_scale=cfg_scale,
+        text=SamplingConfig(temperature=text_temperature, top_k=text_top_k),
+        audio=SamplingConfig(temperature=audio_temperature, top_k=audio_top_k),
+        use_cuda_graph=True,
+    )
+    kwargs = {
+        "prefix_speaker_1": _prepare_prefix(voice_s1),
+        "prefix_speaker_2": _prepare_prefix(voice_s2),
+        "include_prefix": include_prefix,
+    }
+
+    stream = dia.generate_stream(
+        script,
+        config=config,
+        verbose=True,
+        chunk_frames=chunk_frames,
+        **kwargs,
+    )
+
+    all_audio = []
+    chunk_count = 0
+    import time
+    start = time.time()
+
+    for chunk in stream:
+        chunk_np = chunk.detach().cpu().numpy()
+        all_audio.append(chunk_np)
+        chunk_count += 1
+        elapsed = time.time() - start
+        if chunk_count == 1:
+            ttfc = elapsed
+
+        # Yield accumulated audio so far for progressive playback
+        accumulated = np.concatenate(all_audio)
+        yield (sample_rate, accumulated), f"Chunks: {chunk_count} | TTFC: {ttfc:.2f}s | Elapsed: {elapsed:.2f}s"
+
+    elapsed = time.time() - start
+    total_audio = np.concatenate(all_audio)
+    duration = len(total_audio) / sample_rate
+    yield (
+        (sample_rate, total_audio),
+        f"Done! Chunks: {chunk_count} | TTFC: {ttfc:.2f}s | Total: {elapsed:.2f}s | Audio: {duration:.2f}s",
+    )
+
+
+# ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
+
+def _build_script_panel():
+    """Build the shared script + voice prompt + sampling controls panel. Returns controls list and param components."""
+    controls = []
+    for idx in range(MAX_TURNS):
+        speaker = "[S1]" if idx % 2 == 0 else "[S2]"
+        box = gr.Textbox(
+            label=f"{speaker} turn {idx + 1}",
+            lines=2,
+            elem_classes=["compact-turn"],
+            placeholder=f"Enter dialogue for {speaker}…",
+            visible=idx < INITIAL_TURNS,
+        )
+        controls.append(box)
+    return controls
+
+
 def build_interface() -> gr.Blocks:
     with gr.Blocks(
-        title="Dia2 TTS", css=".compact-turn textarea {min-height: 60px}"
+        title="Dia 2.1 TTS", css=".compact-turn textarea {min-height: 60px}"
     ) as demo:
         gr.Markdown(
-            """## Dia2 — Open TTS Model
-Compose dialogue, attach optional voice prompts, and generate audio (CUDA graphs enabled by default)."""
+            """## Dia 2.1 — Streaming Dialogue TTS
+Compose dialogue, attach optional voice prompts, and generate audio. Streaming mode yields audio chunks in real-time as the model generates."""
         )
         turn_state = gr.State(INITIAL_TURNS)
+
         with gr.Row(equal_height=True):
             example_dropdown = gr.Dropdown(
                 choices=["(select example)"] + list(EXAMPLES.keys()),
                 label="Examples",
                 value="(select example)",
             )
+
         with gr.Row(equal_height=True):
+            # Left column: script + controls
             with gr.Column(scale=1):
                 with gr.Group():
                     gr.Markdown("### Script")
@@ -212,15 +325,36 @@ Compose dialogue, attach optional voice prompts, and generate audio (CUDA graphs
                     include_prefix = gr.Checkbox(
                         label="Keep prefix audio in output", value=False
                     )
-                    generate_btn = gr.Button("Generate", variant="primary")
-            with gr.Column(scale=1):
-                gr.Markdown("### Output")
-                audio_out = gr.Audio(label="Waveform", interactive=False)
-                timestamps = gr.Dataframe(
-                    headers=["word", "seconds"], label="Timestamps"
-                )
-                log_box = gr.Textbox(label="Logs", lines=8)
 
+            # Right column: tabbed output
+            with gr.Column(scale=1):
+                with gr.Tabs():
+                    with gr.TabItem("Streaming"):
+                        gr.Markdown("Stream audio chunks as they are generated.")
+                        chunk_frames = gr.Slider(
+                            1, 10, value=3, step=1,
+                            label="Chunk Frames",
+                            info="Mimi frames per chunk (~80ms each). Higher = fewer updates, lower latency overhead.",
+                        )
+                        stream_btn = gr.Button("Generate (Streaming)", variant="primary")
+                        stream_audio_out = gr.Audio(
+                            label="Streaming Output",
+                            streaming=True,
+                            autoplay=True,
+                            interactive=False,
+                        )
+                        stream_status = gr.Textbox(label="Status", lines=2, interactive=False)
+
+                    with gr.TabItem("Batch"):
+                        gr.Markdown("Generate the full audio before playback.")
+                        generate_btn = gr.Button("Generate (Batch)", variant="primary")
+                        audio_out = gr.Audio(label="Waveform", interactive=False)
+                        timestamps = gr.Dataframe(
+                            headers=["word", "seconds"], label="Timestamps"
+                        )
+                        log_box = gr.Textbox(label="Logs", lines=8)
+
+        # Turn management
         add_btn.click(
             lambda c: _add_turn(c),
             inputs=turn_state,
@@ -237,6 +371,7 @@ Compose dialogue, attach optional voice prompts, and generate audio (CUDA graphs
             outputs=[turn_state, *controls, voice_s1, voice_s2],
         )
 
+        # Batch generate
         generate_btn.click(
             generate_audio,
             inputs=[
@@ -253,6 +388,26 @@ Compose dialogue, attach optional voice prompts, and generate audio (CUDA graphs
             ],
             outputs=[audio_out, timestamps, log_box],
         )
+
+        # Streaming generate
+        stream_btn.click(
+            generate_audio_stream,
+            inputs=[
+                turn_state,
+                *controls,
+                voice_s1,
+                voice_s2,
+                cfg_scale,
+                text_temperature,
+                audio_temperature,
+                text_top_k,
+                audio_top_k,
+                include_prefix,
+                chunk_frames,
+            ],
+            outputs=[stream_audio_out, stream_status],
+        )
+
     return demo
 
 
