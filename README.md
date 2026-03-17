@@ -2,11 +2,11 @@
 
 # Dia 2.1
 
-**A streaming dialogue TTS engine. Forked by [Generative Experiences Company](https://github.com/khariha/dia2)**
+**A streaming dialogue TTS engine. Forked by [Generative Experiences Company](https://github.com/khariha/dia2)**.
 
 <a href="https://huggingface.co/nari-labs/Dia2-2B"><img src="https://img.shields.io/badge/HF%20Repo-Dia2--2B-orange?style=for-the-badge"></a>
 <a href="https://github.com/nari-labs/dia2"><img src="https://img.shields.io/badge/Upstream-nari--labs%2Fdia2-333?style=for-the-badge&logo=github"></a>
-<a href="https://github.com/nari-labs/dia2/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg?style=for-the-badge"></a>
+<a href="https://github.com/khariha/dia2/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg?style=for-the-badge"></a>
 
 </div>
 
