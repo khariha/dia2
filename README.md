@@ -2,7 +2,7 @@
 
 # Dia 2.1
 
-**A streaming dialogue TTS engine — forked by [Generative Experiences Company](https://github.com/khariha/dia2)**
+**A streaming dialogue TTS engine. Forked by [Generative Experiences Company](https://github.com/khariha/dia2)**
 
 <a href="https://huggingface.co/nari-labs/Dia2-2B"><img src="https://img.shields.io/badge/HF%20Repo-Dia2--2B-orange?style=for-the-badge"></a>
 <a href="https://github.com/nari-labs/dia2"><img src="https://img.shields.io/badge/Upstream-nari--labs%2Fdia2-333?style=for-the-badge&logo=github"></a>
@@ -28,13 +28,13 @@ for chunk in stream:
     play(chunk.cpu().numpy())  # ~80 ms per chunk at 12.5 fps
 ```
 
-Each chunk is a `torch.Tensor` with shape `[N_samples]` (float32, range `[-1, 1]`). The `chunk_frames` parameter controls how many Mimi frames (~80 ms each) are batched per yield — larger values reduce overhead at the cost of higher initial latency.
+Each chunk is a `torch.Tensor` with shape `[N_samples]` (float32, range `[-1, 1]`). The `chunk_frames` parameter controls how many Mimi frames (~80 ms each) are batched per yield, larger values reduce overhead at the cost of higher initial latency.
 
 ### Stateless Transcript Caching
 
 When using voice conditioning (prefix speakers), Dia2 runs Whisper to transcribe each prefix audio file. This is slow. Dia 2.1 returns the Whisper transcript and a SHA-256 audio hash with every generation response, so you can pass them back on subsequent calls to **skip Whisper entirely**.
 
-**First call — Whisper runs, transcript returned:**
+**First call: Whisper runs, transcript returned:**
 ```python
 stream = dia.generate_stream(script, prefix_speaker_1="speaker.wav")
 for chunk in stream:
@@ -44,7 +44,7 @@ for chunk in stream:
 transcript_1 = stream.prefix_transcripts["speaker_1"]
 ```
 
-**Second call — Whisper skipped:**
+**Second call: Whisper skipped:**
 ```python
 stream = dia.generate_stream(
     script,
@@ -55,7 +55,7 @@ for chunk in stream:
     play(chunk.cpu().numpy())
 ```
 
-This is fully **stateless** — no files are cached on disk. The caller manages their own transcript data. The same pattern works with `generate()` via `result.prefix_transcripts`.
+This is fully **stateless** so no files are cached on disk. The caller manages their own transcript data. The same pattern works with `generate()` via `result.prefix_transcripts`.
 
 ### Transcript & Hash Return Format
 
@@ -77,8 +77,8 @@ Both `generate()` and `generate_stream()` return transcript data in this format:
 }
 ```
 
-- `audio_hash` — SHA-256 of the prefix audio file, for verifying the transcript matches
-- `words` — Whisper word-level timestamps (same format Whisper produces)
+- `audio_hash`: SHA-256 of the prefix audio file, for verifying the transcript matches
+- `words`: Whisper word-level timestamps (same format Whisper produces)
 
 For `generate()`, access via `result.prefix_transcripts`. For `generate_stream()`, access via `stream.prefix_transcripts`.
 
@@ -89,7 +89,7 @@ For `generate()`, access via `result.prefix_transcripts`. For `generate_stream()
 ```python
 stream = dia.generate_stream(script, prefix_speaker_1="speaker.wav")
 
-# Available immediately — no need to iterate first
+# Available immediately, no need to iterate first
 print(stream.prefix_transcripts)
 
 # Then iterate as normal
@@ -101,15 +101,15 @@ for chunk in stream:
 
 All performance optimizations from the upstream Dia2 repo are included:
 
-- **RotaryEmbedding sin/cos caching** — pre-computed at init, table lookup instead of per-step computation
-- **CPU-GPU sync elimination** — replaced `if tensor.any().item()` with `torch.where()` to avoid GPU stalls
-- **On-device model initialization** — layers created directly on the target device, avoiding CPU-to-GPU transfer
-- **Lazy safetensors loading** — weights loaded tensor-by-tensor for lower peak memory
-- **`torch.compile` support** — optional `use_torch_compile=True` for additional speed on supported hardware
+- **RotaryEmbedding sin/cos caching**: pre-computed at init, table lookup instead of per-step computation
+- **CPU-GPU sync elimination**: replaced `if tensor.any().item()` with `torch.where()` to avoid GPU stalls
+- **On-device model initialization**: layers created directly on the target device, avoiding CPU-to-GPU transfer
+- **Lazy safetensors loading**: weights loaded tensor-by-tensor for lower peak memory
+- **`torch.compile` support**: optional `use_torch_compile=True` for additional speed on supported hardware
 
 ## Quickstart
 
-> **Requirement** — install [uv](https://docs.astral.sh/uv/) and use CUDA 12.8+
+> **Requirement**: install [uv](https://docs.astral.sh/uv/) and use CUDA 12.8+
 > drivers. All commands below run through `uv run …` as a rule.
 
 1. **Install dependencies (one-time):**
@@ -126,7 +126,7 @@ All performance optimizations from the upstream Dia2 repo are included:
      --cuda-graph --verbose \
      output.wav
    ```
-   The first run downloads weights/tokenizer/Mimi. The CLI auto-selects CUDA when available (otherwise CPU) and defaults to bfloat16 precision — override with `--device` / `--dtype` if needed.
+   The first run downloads weights/tokenizer/Mimi. The CLI auto-selects CUDA when available (otherwise CPU) and defaults to bfloat16 precision, override with `--device` / `--dtype` if needed.
 4. **Conditional Generation (recommended for stable output):**
    ```bash
    uv run -m dia2.cli \
